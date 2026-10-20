@@ -2,7 +2,8 @@
 
 """
 Inference, evaluation and reporting for the JITrans classifier and for the
-stacking meta-learner (RandomForest, XGBoost or CatBoost).
+stacking meta-learner (RandomForest, XGBoost, CatBoost or multinomial
+logistic regression).
 
 This is the JIT-side twin of `rscd_mamba/core/processing/inference.py`: same
 metric set, same plots, same exported files, so that JITrans, RSCDMamba and the
@@ -26,7 +27,7 @@ Three entry points, selected by `--model` (or by `--train-log` alone):
    complexity / latency / memory benchmarks.
 
 3. `StackingInference`
-   Loads `stacking/<rf|xgboost|catboost>_meta.joblib` (written by stacking.py)
+   Loads `stacking/<rf|xgboost|catboost|logreg>_meta.joblib` (written by stacking.py)
    plus the exported `.npz` probability files and evaluates the meta-learner
    through the very same reporting layer.  `--compare` puts JITrans, Mamba and
    the stacking side by side.  Exported files are named after
@@ -3638,7 +3639,7 @@ class JITInference(BaseEvaluator):
         return summary
 
 # ======================================================================
-# Stacking (RandomForest / XGBoost / CatBoost meta-learner) inference
+# Stacking (RandomForest / XGBoost / CatBoost / LogReg meta-learner) inference
 # ======================================================================
 
 STACKING_HOWTO = """
@@ -3651,14 +3652,15 @@ The stacking artefacts are produced in three steps:
   2. python export_probs_mamba.py ...                 (rscd_mamba env)
          -> mamba_val.npz, mamba_test.npz, copied into the same preds dir
 
-  3. python stacking.py --preds_dir stacking/preds --meta_learner {rf,xgboost,catboost}
+  3. python stacking.py --preds_dir stacking/preds --meta_learner {rf,xgboost,catboost,logreg}
          -> stacking/<meta_learner>_meta.joblib
 """
 
 
 class StackingInference(BaseEvaluator):
     """
-    Evaluation of the stacking meta-learner (RandomForest, XGBoost or CatBoost)
+    Evaluation of the stacking meta-learner (RandomForest, XGBoost, CatBoost or
+    multinomial logistic regression)
     trained by `stacking.py`.  Everything that depends on the kind of
     meta-learner goes through `meta_learners`.
 
@@ -3911,8 +3913,10 @@ class StackingInference(BaseEvaluator):
     # ------------------------------------------------------------------
     #
     # The torch-based `calculate_model_complexity` of JITrans (parameters +
-    # FlopCounterMode on a forward pass) does not apply to a tree ensemble:
-    # it has no tensors and executes no floating-point layers.  The
+    # FlopCounterMode on a forward pass) does not apply to a scikit-learn /
+    # boosting estimator: it has no tensors (a tree ensemble executes no
+    # floating-point layers at all; the logistic regression FLOPs are counted
+    # analytically from its coefficients).  The
     # equivalents below describe the meta-learner alone; the base models,
     # which dominate the cost of the ensemble, run in their own conda envs
     # and are folded in from the JSON reports they export.
@@ -3924,7 +3928,8 @@ class StackingInference(BaseEvaluator):
 
         The meta-learner keeps the threads it was trained with (stacking.py
         --n_jobs); with -1 every `predict_proba` call on one row pays the
-        thread pool start-up, which dwarfs the actual tree traversal.
+        thread pool start-up, which dwarfs the actual tree traversal (the
+        logistic regression has its BLAS pool limited instead).
         Inside this context `_raw_predict_proba` runs single-threaded.
         """
         from meta_learners import single_thread
@@ -3989,19 +3994,24 @@ class StackingInference(BaseEvaluator):
     def calculate_model_complexity(self, verbose: bool = True,
                                    max_path_samples: int = 2000) -> Dict:
         """
-        Complexity of the tree-ensemble meta-learner (RF / XGBoost / CatBoost).
+        Complexity of the meta-learner.
 
+        Tree ensembles (RF / XGBoost / CatBoost):
         Size:  trees, nodes, leaves, depth, stored values (feature index +
                threshold per split, leaf values), serialized size.
         Cost:  split comparisons per sample, measured on the real
                meta-features (see `meta_learners.tree_ensemble_stats` for the
                per-library method), plus the leaf-value additions.  This is
                the tree-ensemble analogue of FLOPs; it is NOT in the same unit.
+
+        Logistic regression: see `_linear_model_complexity`.
         """
         import pickle
-        from meta_learners import n_threads, tree_ensemble_stats
+        from meta_learners import is_tree_ensemble, n_threads, tree_ensemble_stats
 
         meta = self.meta
+        if not is_tree_ensemble(meta):
+            return self._linear_model_complexity(verbose)
         n_classes = len(meta.classes_)
 
         split_name, block = self._default_block()
@@ -4073,6 +4083,89 @@ class StackingInference(BaseEvaluator):
         results['_report'] = self._emit(lines) if verbose else lines
         return results
 
+    def _linear_model_complexity(self, verbose: bool = True) -> Dict:
+        """
+        Complexity of the logistic-regression meta-learner.
+
+        Size:  coefficients + intercepts (the trainable parameters, which live
+               in NumPy, not torch), serialized size.
+        Cost:  genuine FLOPs, computed analytically from the coefficient matrix
+               (see `meta_learners.linear_model_stats`); they do not depend on
+               the input, so no sample is needed.
+        The tree-only keys are kept as None so the result has a single schema.
+        """
+        import pickle
+        from meta_learners import linear_model_stats
+
+        meta = self.meta
+        stats = linear_model_stats(meta)
+        total_params = stats['total_params']
+        flops = stats['flops_per_sample']
+        macs = stats['macs_per_sample']
+        serialized_mb = len(pickle.dumps(meta, protocol=pickle.HIGHEST_PROTOCOL)) / 1024**2
+        file_mb = (os.path.getsize(self.model_path) / 1024**2
+                   if self.model_path and os.path.isfile(self.model_path) else None)
+        fmt = self._format_count
+
+        results = {
+            'estimator': type(meta).__name__,
+            'meta_learner': self.meta_learner,
+            'n_estimators': None,
+            'n_trees': None,
+            'n_features_in': stats['n_features'],
+            'n_classes': stats['n_classes_fitted'],
+            'max_depth_param': None,
+            'total_nodes': None,
+            'total_split_nodes': None,
+            'total_leaves': None,
+            'mean_nodes_per_tree': None,
+            'max_depth': None,
+            'mean_depth': None,
+            'n_weights': stats['n_weights'],
+            'n_biases': stats['n_biases'],
+            'stored_values': total_params,
+            'stored_values_formatted': fmt(total_params),
+            'trainable_params': total_params,
+            'model_size_mb': serialized_mb,
+            'checkpoint_size_mb': file_mb,
+            'nodes_visited_per_sample': None,
+            'comparisons_per_sample': None,
+            'ops_per_sample': float(flops),
+            'ops_convention': stats['cost_convention'],
+            'ops_measured_on': 'analytic (coefficient shape)',
+            'flops': flops,
+            'flops_formatted': fmt(flops),
+            'macs': macs,
+            'macs_formatted': fmt(macs),
+            'flops_convention': stats['cost_convention'],
+            'C': meta.C,
+            'n_iter': int(np.max(meta.n_iter_)),
+            'max_iter': meta.max_iter,
+            'n_jobs_trained': None,
+            'method': f'{self.meta_learner}_analytic',
+        }
+
+        size_file = f"{file_mb:.4f} MB" if file_mb is not None else 'N/A'
+        lines = [
+            "=" * 60,
+            f"META-LEARNER COMPLEXITY ({self.meta_display})",
+            "=" * 60,
+            f"Estimator:             {results['estimator']}  (C={meta.C:g}, "
+            f"{results['n_iter']}/{meta.max_iter} lbfgs iterations)",
+            f"Meta-features:         {results['n_features_in']}  "
+            f"({' + '.join(self.feature_order)} probabilities)",
+            f"Parameters:            {fmt(total_params)} ({total_params:,})  "
+            f"[{stats['n_weights']:,} weights + {stats['n_biases']:,} biases, NumPy]",
+            f"Size (serialized):     {serialized_mb:.4f} MB",
+            f"joblib on disk:        {size_file}",
+            f"MACs / sample:         {macs:,}",
+            f"FLOPs / sample:        {flops:,}",
+            f"Convention:            {stats['cost_convention']}",
+            "=" * 60,
+        ]
+        results['_report'] = self._emit(lines) if verbose else lines
+        return results
+
     def pipeline_complexity(self, meta: Dict) -> Optional[Dict]:
         """
         Complexity of the whole ensemble: JITrans + Mamba + meta-learner.
@@ -4080,7 +4173,8 @@ class StackingInference(BaseEvaluator):
         The base-model numbers are read from their model_summary_<model>.json
         (written by `--model-summary` in each repo).  FLOPs are summed only
         when both reports use the same convention; the meta-learner operations
-        are a different unit and stay separate.
+        (tree ensembles: a different unit; logistic regression: FLOPs counted
+        analytically, negligible next to the base models) stay separate.
         """
         bases = self._load_base_files('model_summary')
         if not bases:
@@ -4137,6 +4231,7 @@ class StackingInference(BaseEvaluator):
             'gflops': flops / 1e9 if flops is not None else None,
             'gmacs': macs / 1e9 if macs is not None else None,
             'meta_learner_ops_per_sample': meta.get('ops_per_sample'),
+            'meta_learner_flops': meta.get('flops'),
             'meta_learner_stored_values': meta.get('stored_values'),
             'model_size_mb': (base_size + meta['model_size_mb']
                               if base_size is not None else None),
@@ -4149,9 +4244,14 @@ class StackingInference(BaseEvaluator):
             lines.append(f"{model:<8} params {fmt(v['total_params']):>9}   "
                          f"FLOPs {fmt(v['flops']):>9}   MACs {fmt(v['macs']):>9}   "
                          f"[{v['method']}]")
+        if meta.get('flops') is not None:
+            lines.append(f"{self.meta_learner:<8} params {meta['stored_values_formatted']:>9}   "
+                         f"FLOPs {fmt(meta['flops']):>9}   MACs {fmt(meta['macs']):>9}   "
+                         f"[{meta['method']}, not summed]")
+        else:
+            lines.append(f"{self.meta_learner:<8} stored values {meta['stored_values_formatted']}, "
+                         f"{meta['ops_per_sample']:,.0f} ops/sample (not FLOPs)")
         lines += [
-            f"{self.meta_learner:<8} stored values {meta['stored_values_formatted']}, "
-            f"{meta['ops_per_sample']:,.0f} ops/sample (not FLOPs)",
             "-" * 60,
             f"Total params (base):   {fmt(result['total_params'])}",
             f"Total FLOPs (base):    {fmt(flops)}"
@@ -4214,7 +4314,9 @@ class StackingInference(BaseEvaluator):
             f"Min/Max Time: {results['min_time_ms']:.3f} / {results['max_time_ms']:.3f} ms",
             f"Throughput:   {results['throughput']:.2f} samples/sec",
             f"Device:       {results['device']} ({results['device_name']})",
-            f"n_jobs:       1 for the timing (trained with {n_jobs_trained})",
+            f"n_jobs:       1 for the timing (trained with {n_jobs_trained})"
+            if n_jobs_trained is not None else
+            "Threads:      BLAS limited to 1 for the timing (threadpoolctl)",
             "=" * 60,
         ]
         print()
@@ -4579,7 +4681,7 @@ class StackingInference(BaseEvaluator):
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description='Run inference, evaluation and reporting on the JITrans '
-                    'classifier or on the stacking meta-learner (rf / xgboost / catboost)',
+                    'classifier or on the stacking meta-learner (rf / xgboost / catboost / logreg)',
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
 
@@ -4617,7 +4719,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--meta-model', '--rf', dest='meta_model', type=str,
                         default='stacking/rf_meta.joblib',
                         help='Path to the meta-model saved by stacking.py '
-                             '(<rf|xgboost|catboost>_meta.joblib; --rf is kept as an alias)')
+                             '(<rf|xgboost|catboost|logreg>_meta.joblib; --rf is kept as an alias)')
     parser.add_argument('--preds-dir', type=str, default='stacking/preds',
                         help='Directory holding jit_*.npz and mamba_*.npz')
     parser.add_argument('--compare', action='store_true',
@@ -4646,7 +4748,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--evaluate', action='store_true',
                         help='Evaluate on the selected dataset split(s)')
     parser.add_argument('--model-summary', action='store_true',
-                        help='Model complexity (params / FLOPs; for stacking: RF size, '
+                        help='Model complexity (params / FLOPs; for stacking: meta-learner size, '
                              'ops per sample and full-pipeline totals), printed and '
                              'saved as model_summary_<model>.json/.txt')
     parser.add_argument('--benchmark', action='store_true',

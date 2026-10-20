@@ -3,7 +3,8 @@
 
 """
 Stacking ensemble (stacked generalization) of JITrans + RSCDMamba with a selectable
-meta-learner: RandomForest (default), XGBoost or CatBoost (see meta_learners.py).
+meta-learner: RandomForest (default), XGBoost, CatBoost or multinomial logistic regression
+(see meta_learners.py).
 
 Pipeline:
   1. Both base models export their softmax probabilities on the `val` and `test` splits
@@ -26,6 +27,7 @@ Run in the JIT conda env:
     python stacking.py --preds_dir stacking/preds
     python stacking.py --meta_learner xgboost --learning_rate 0.05 --n_estimators 500
     python stacking.py --meta_learner catboost --max_depth 4
+    python stacking.py --meta_learner logreg --C 1.0
     python stacking.py --out_dir ../datahome/staking_data/staking_no_classweight --class_weight none
 """
 
@@ -195,14 +197,16 @@ def get_args():
     p.add_argument("--meta_learner", default="rf", choices=META_LEARNERS,
                    help="Meta-learner trained on the base models' probabilities.")
     # Hyper-parameters shared by all meta-learners
+    p.add_argument("--class_weight", default="balanced", choices=CLASS_WEIGHTS,
+                   help="'balanced_subsample' is available only for rf.")
+    p.add_argument("--random_state", default=42, type=int)
+    p.add_argument("--n_jobs", default=-1, type=int,
+                   help="Threads of the tree ensembles (ignored by logreg).")
+    # Tree ensembles only (rf / xgboost / catboost)
     p.add_argument("--n_estimators", default=300, type=int,
                    help="Trees of the forest (rf) or boosting rounds (xgboost / catboost).")
     p.add_argument("--max_depth", default=None, type=int,
                    help="Tree depth. Default: unlimited for rf, 6 for xgboost / catboost.")
-    p.add_argument("--class_weight", default="balanced", choices=CLASS_WEIGHTS,
-                   help="'balanced_subsample' is available only for rf.")
-    p.add_argument("--random_state", default=42, type=int)
-    p.add_argument("--n_jobs", default=-1, type=int)
     # Random Forest only
     p.add_argument("--min_samples_leaf", default=1, type=int)
     # Boosting only (xgboost / catboost)
@@ -212,6 +216,11 @@ def get_args():
     p.add_argument("--colsample_bytree", default=1.0, type=float)
     # CatBoost only
     p.add_argument("--l2_leaf_reg", default=3.0, type=float)
+    # Logistic regression only
+    p.add_argument("--C", default=1.0, type=float,
+                   help="Inverse of the L2 regularisation strength.")
+    p.add_argument("--max_iter", default=1000, type=int,
+                   help="lbfgs iterations.")
     return p.parse_args()
 
 
@@ -240,6 +249,8 @@ def main():
         subsample=args.subsample,
         colsample_bytree=args.colsample_bytree,
         l2_leaf_reg=args.l2_leaf_reg,
+        C=args.C,
+        max_iter=args.max_iter,
         class_weight=args.class_weight,
         random_state=args.random_state,
         n_jobs=args.n_jobs,

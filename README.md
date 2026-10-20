@@ -17,7 +17,7 @@ class distribution back as its next input token.
 | `dataloader.py` | RSCD `ImageFolder` datasets and timm transforms |
 | `export_probs.py` | Exports JITrans softmax probabilities on val/test for the stacking |
 | `stacking.py` | Trains the stacking meta-learner on val, evaluates on test |
-| `meta_learners.py` | RandomForest / XGBoost / CatBoost meta-learners |
+| `meta_learners.py` | RandomForest / XGBoost / CatBoost / multinomial logistic regression meta-learners |
 | `inference.py` | Evaluation, plots, complexity and latency of JITrans and of the stacking |
 | `param_train.sh`, `jit_training.slurm` | Training launchers (local GPU / SLURM) |
 
@@ -46,23 +46,29 @@ The dataset root must contain `train/`, `val/` and `test/` in `ImageFolder` layo
        python stacking.py --preds_dir stacking/preds --out_dir stacking --meta_learner rf
        python stacking.py --preds_dir stacking/preds --out_dir stacking --meta_learner xgboost
        python stacking.py --preds_dir stacking/preds --out_dir stacking --meta_learner catboost
+       python stacking.py --preds_dir stacking/preds --out_dir stacking --meta_learner logreg
 
    Writes `<meta_learner>_meta.joblib` and `stacking_test_metrics_<meta_learner>.json`.
 
    | Flag | Meta-learners | Default |
    |---|---|---|
    | `--meta_learner` | | `rf` |
-   | `--n_estimators` | all (trees / boosting rounds) | 300 |
-   | `--max_depth` | all | unlimited for rf, 6 for xgboost / catboost |
+   | `--n_estimators` | rf, xgboost, catboost (trees / boosting rounds) | 300 |
+   | `--max_depth` | rf, xgboost, catboost | unlimited for rf, 6 for xgboost / catboost |
    | `--class_weight` | all (`balanced`, `none`; `balanced_subsample` rf only) | `balanced` |
-   | `--random_state`, `--n_jobs` | all | 42, -1 |
+   | `--random_state` | all | 42 |
+   | `--n_jobs` | rf, xgboost, catboost | -1 |
    | `--min_samples_leaf` | rf | 1 |
    | `--learning_rate` | xgboost, catboost | 0.1 |
    | `--subsample`, `--colsample_bytree` | xgboost | 1.0, 1.0 |
    | `--l2_leaf_reg` | catboost | 3.0 |
+   | `--C`, `--max_iter` | logreg (L2, lbfgs) | 1.0, 1000 |
 
    The meta-learner is trained on the whole val split, so the boosting models run a fixed
    number of rounds: early stopping would need a held-out part of val (or test).
+   The logistic regression (`logreg`) is multinomial (softmax) and is fitted on the raw
+   probabilities, which are already in [0, 1], so no scaler is used. Its `--model-summary`
+   reports parameters and FLOPs instead of the tree statistics.
 
 3. Evaluate it:
 

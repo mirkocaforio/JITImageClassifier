@@ -2,7 +2,8 @@
 # -*- coding: utf-8 -*-
 
 """
-Meta-learners of the stacking ensemble: RandomForest, XGBoost and CatBoost.
+Meta-learners of the stacking ensemble: RandomForest, XGBoost, CatBoost and multinomial
+logistic regression.
 
 Everything that depends on the kind of meta-learner lives here, so that `stacking.py`
 (training) and `inference.py` (evaluation / complexity / latency) stay agnostic:
@@ -12,16 +13,20 @@ Everything that depends on the kind of meta-learner lives here, so that `stackin
   - predict_proba_canonical                 probabilities in the canonical 0..C-1 order,
                                             optionally on a single thread (latency runs)
   - tree_ensemble_stats                     size and per-sample cost of the tree ensemble
+  - linear_model_stats                      parameters and FLOPs of the logistic regression
 
 xgboost and catboost are imported lazily, so the RandomForest path works without them.
 """
 
 import contextlib
+import warnings
 
 import numpy as np
 
-META_LEARNERS = ("rf", "xgboost", "catboost")
-DISPLAY_NAMES = {"rf": "RandomForest", "xgboost": "XGBoost", "catboost": "CatBoost"}
+META_LEARNERS = ("rf", "xgboost", "catboost", "logreg")
+DISPLAY_NAMES = {"rf": "RandomForest", "xgboost": "XGBoost", "catboost": "CatBoost",
+                 "logreg": "Multinomial LogReg"}
+TREE_ENSEMBLES = ("rf", "xgboost", "catboost")
 CLASS_WEIGHTS = ("balanced", "balanced_subsample", "none")
 
 # Tree depth used by the boosting models when --max_depth is not given
@@ -34,7 +39,7 @@ def display_name(name):
 
 
 def meta_learner_name(model):
-    """Short name ('rf' / 'xgboost' / 'catboost') of a fitted estimator."""
+    """Short name ('rf' / 'xgboost' / 'catboost' / 'logreg') of a fitted estimator."""
     cls = type(model).__name__
     if cls == "RandomForestClassifier":
         return "rf"
@@ -42,7 +47,13 @@ def meta_learner_name(model):
         return "xgboost"
     if cls == "CatBoostClassifier":
         return "catboost"
+    if cls == "LogisticRegression":
+        return "logreg"
     raise ValueError(f"Unsupported meta-learner: {cls}")
+
+
+def is_tree_ensemble(model):
+    return meta_learner_name(model) in TREE_ENSEMBLES
 
 
 # ---------------------------------------------------------------------------
@@ -59,6 +70,8 @@ def build_meta_learner(
     subsample=1.0,
     colsample_bytree=1.0,
     l2_leaf_reg=3.0,
+    C=1.0,
+    max_iter=1000,
     class_weight="balanced",
     random_state=42,
     n_jobs=-1,
@@ -66,7 +79,7 @@ def build_meta_learner(
     """
     Instantiate an (unfitted) meta-learner.
     Args:
-        name (str): 'rf', 'xgboost' or 'catboost'.
+        name (str): 'rf', 'xgboost', 'catboost' or 'logreg'.
         n_classes (int): Number of classes of the task.
         n_estimators (int): Trees of the forest / boosting rounds.
         max_depth (int | None): Tree depth. None = unlimited for rf, 6 for the boosting models.
@@ -74,9 +87,12 @@ def build_meta_learner(
         min_samples_leaf (int): rf only.
         subsample, colsample_bytree (float): xgboost only (row / column sampling per tree).
         l2_leaf_reg (float): catboost only (L2 regularisation of the leaf values).
+        C (float): logreg only (inverse of the L2 regularisation strength).
+        max_iter (int): logreg only (lbfgs iterations).
         class_weight (str): 'balanced', 'balanced_subsample' (rf only) or 'none'.
         random_state (int): Seed.
-        n_jobs (int): Threads (-1 = all cores).
+        n_jobs (int): Threads (-1 = all cores). Ignored by logreg, whose n_jobs is
+            deprecated in scikit-learn >= 1.8 (lbfgs threads through BLAS).
     Returns:
         The estimator. Train it with `fit_meta_learner`, which applies the class weighting
         of the libraries that take it at fit time (xgboost).
@@ -99,6 +115,20 @@ def build_meta_learner(
             class_weight=None if class_weight == "none" else class_weight,
             random_state=random_state,
             n_jobs=n_jobs,
+        )
+
+    if name == "logreg":
+        from sklearn.linear_model import LogisticRegression
+
+        # lbfgs fits the multinomial (softmax) model for C > 2 classes. multi_class
+        # (removed in 1.8), penalty and n_jobs (deprecated in 1.8) are left out on
+        # purpose: the default penalty is L2. No scaler: the probabilities are in [0, 1].
+        return LogisticRegression(
+            C=C,
+            solver="lbfgs",
+            max_iter=max_iter,
+            class_weight=None if class_weight == "none" else class_weight,
+            random_state=random_state,
         )
 
     depth = DEFAULT_BOOSTING_DEPTH if max_depth is None else max_depth
@@ -147,10 +177,23 @@ def check_labels(y, n_classes, split_name="val"):
 
 def fit_meta_learner(model, X, y, class_weight="balanced"):
     """Fit the meta-learner; xgboost has no class_weight, so balancing goes through sample_weight."""
-    if meta_learner_name(model) == "xgboost" and class_weight.lower() == "balanced":
+    name = meta_learner_name(model)
+    if name == "xgboost" and class_weight.lower() == "balanced":
         from sklearn.utils.class_weight import compute_sample_weight
 
         return model.fit(X, y, sample_weight=compute_sample_weight("balanced", y))
+    if name == "logreg":
+        from sklearn.exceptions import ConvergenceWarning
+
+        # The ConvergenceWarning is easy to miss in the log: report it explicitly
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", ConvergenceWarning)
+            model.fit(X, y)
+        n_iter = int(np.max(model.n_iter_))
+        if n_iter >= model.max_iter:
+            print(f"[meta_learners] WARNING logreg did not converge in {model.max_iter} "
+                  f"lbfgs iterations: raise --max_iter")
+        return model
     return model.fit(X, y)
 
 
@@ -160,7 +203,10 @@ def fit_meta_learner(model, X, y, class_weight="balanced"):
 
 def n_threads(model):
     """Threads the meta-learner was trained with (n_jobs / thread_count)."""
-    if meta_learner_name(model) == "catboost":
+    name = meta_learner_name(model)
+    if name == "logreg":
+        return None  # BLAS threading, no n_jobs
+    if name == "catboost":
         # get_param is None when the default (-1, all cores) was kept
         threads = model.get_param("thread_count")
         return -1 if threads is None else threads
@@ -174,10 +220,18 @@ def single_thread(model):
 
     With n_jobs = -1 every predict_proba on one row pays the thread pool start-up, which
     dwarfs the actual tree traversal. CatBoost takes the thread count as a predict_proba
-    argument instead (see predict_proba_canonical), so it is left untouched here.
+    argument instead (see predict_proba_canonical), so it is left untouched here. The
+    logistic regression has no thread setting of its own: its matrix product runs in
+    BLAS, which is limited to one thread through threadpoolctl.
     """
     name = meta_learner_name(model)
     original = n_threads(model)
+    if name == "logreg":
+        from threadpoolctl import threadpool_limits
+
+        with threadpool_limits(limits=1):
+            yield original
+        return
     if name == "rf":
         model.n_jobs = 1
     elif name == "xgboost":
@@ -230,7 +284,45 @@ def tree_ensemble_stats(model, X):
         return _rf_stats(model, X)
     if name == "xgboost":
         return _xgb_stats(model, X)
-    return _catboost_stats(model, X)
+    if name == "catboost":
+        return _catboost_stats(model, X)
+    raise ValueError(f"{display_name(name)} is not a tree ensemble: use linear_model_stats")
+
+
+def linear_model_stats(model):
+    """
+    Parameters and per-sample cost of the logistic regression.
+
+    Returned keys: n_classes_fitted, n_features, n_weights, n_biases, total_params,
+    macs_per_sample, flops_per_sample, cost_convention.
+
+    Unlike the tree ensembles these are genuine FLOPs: one (n_classes x n_features)
+    matrix-vector product, the bias and the softmax (multinomial) or the sigmoid
+    (binary, single row of coefficients).
+    """
+    coef = np.asarray(model.coef_)
+    intercept = np.asarray(model.intercept_)
+    rows, n_features = coef.shape
+    n_classes = len(model.classes_)
+    macs = rows * n_features
+    if rows == 1:
+        # binary: one logit -> sigmoid (exp, add, div) and 1 - p
+        activation, activation_note = 4, "sigmoid (4)"
+    else:
+        # softmax: max subtraction (C), exp (C), sum (C - 1), division (C)
+        activation, activation_note = 4 * rows - 1, "softmax (4C - 1)"
+    flops = 2 * macs + intercept.size + activation
+    return {
+        "n_classes_fitted": n_classes,
+        "n_features": n_features,
+        "n_weights": int(coef.size),
+        "n_biases": int(intercept.size),
+        "total_params": int(coef.size + intercept.size),
+        "macs_per_sample": int(macs),
+        "flops_per_sample": int(flops),
+        "cost_convention": f"FLOPs = 2 x MACs (matrix-vector product) + bias + "
+                           f"{activation_note}",
+    }
 
 
 def _rf_stats(rf, X):
