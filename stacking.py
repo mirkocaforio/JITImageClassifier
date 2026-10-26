@@ -12,14 +12,17 @@ Pipeline:
          <preds_dir>/jit_val.npz,  jit_test.npz
          <preds_dir>/mamba_val.npz, mamba_test.npz
   2. This script aligns the two models PER IMAGE using the rel_paths key, builds the
-     meta-features X = concat(probs_jit, probs_mamba)  (N, 2*C), trains the meta-learner
-     on the VAL split, and evaluates it on the TEST split.
+     meta-features X = concat(probs_jit, probs_mamba)  (N, 2*C), optionally as
+     log-probabilities (--features logprobs), trains the meta-learner on the VAL split,
+     and evaluates it on the TEST split.
 
 No data leakage: the meta-learner is trained only on val predictions; test is held out
 for the final evaluation. For the same reason the boosting models run a fixed number of
-rounds (no early stopping, which would need a held-out part of val or test).
+rounds: choose it, and the other hyper-parameters, with tune_meta.py (cross-validation
+on val, early stopping inside the folds), never by looking at test.
 Metrics are reported through the project's CrossEntropyLossStrategy.compute_metrics so
-the format matches main.py.
+the format matches main.py. The meta-learner is also compared with Mamba, JITrans and the
+plain average of their probabilities (McNemar's exact test, bootstrap 95% CI).
 
 Outputs (in --out_dir): <meta_learner>_meta.joblib and stacking_test_metrics_<meta_learner>.json
 
@@ -27,7 +30,7 @@ Run in the JIT conda env:
     python stacking.py --preds_dir stacking/preds
     python stacking.py --meta_learner xgboost --learning_rate 0.05 --n_estimators 500
     python stacking.py --meta_learner catboost --max_depth 4
-    python stacking.py --meta_learner logreg --C 1.0
+    python stacking.py --meta_learner logreg --features logprobs --C 0.1
     python stacking.py --out_dir ../datahome/staking_data/staking_no_classweight --class_weight none
 """
 
@@ -42,11 +45,13 @@ import torch
 from loss import CrossEntropyLossStrategy
 from meta_learners import (
     CLASS_WEIGHTS,
+    FEATURES,
     META_LEARNERS,
     build_meta_learner,
     check_labels,
     display_name,
     fit_meta_learner,
+    meta_features,
     predict_proba_canonical,
 )
 
@@ -146,6 +151,43 @@ def base_model_probs_from_X(X, n_classes, which):
     return X[:, n_classes:2 * n_classes]
 
 
+def paired_comparison(proba_a, proba_b, targets, n_boot=2000, seed=0):
+    """Paired test of model a against model b on the same samples.
+
+    McNemar's exact test (binomial on the discordant pairs) and a bootstrap 95% CI of the
+    accuracy difference a - b. With accuracies this close the bare difference is not
+    enough: on ~50k test images a few tens of images are within the noise.
+    """
+    from scipy.stats import binomtest
+
+    correct_a = np.asarray(proba_a).argmax(1) == targets
+    correct_b = np.asarray(proba_b).argmax(1) == targets
+    only_a = int((correct_a & ~correct_b).sum())
+    only_b = int((~correct_a & correct_b).sum())
+    p_value = binomtest(only_a, only_a + only_b, 0.5).pvalue if only_a + only_b else 1.0
+
+    diff = correct_a.astype(np.float64) - correct_b
+    rng = np.random.default_rng(seed)
+    boot = np.array([diff[rng.integers(0, len(diff), len(diff))].mean() for _ in range(n_boot)])
+    return {
+        "delta_accuracy": float(diff.mean()),
+        "delta_accuracy_ci95": [float(np.percentile(boot, 2.5)), float(np.percentile(boot, 97.5))],
+        "only_a_correct": only_a,
+        "only_b_correct": only_b,
+        "mcnemar_p": float(p_value),
+    }
+
+
+def print_comparisons(name, comparisons):
+    print("\n[stacking] paired comparisons on test (McNemar exact, bootstrap 95% CI):")
+    for other, c in comparisons.items():
+        lo, hi = c["delta_accuracy_ci95"]
+        print(f"  {name} vs {other:<10}: {c['delta_accuracy'] * 100:+.2f} pp "
+              f"[{lo * 100:+.2f}, {hi * 100:+.2f}]  "
+              f"({c['only_a_correct']} vs {c['only_b_correct']} discordant, "
+              f"p = {c['mcnemar_p']:.2g})")
+
+
 def print_report(title, metrics, classes):
     W = 62
     print("\n" + "=" * W)
@@ -196,6 +238,9 @@ def get_args():
     p.add_argument("--out_dir", default="../datahome/stacking_data/", type=str)
     p.add_argument("--meta_learner", default="rf", choices=META_LEARNERS,
                    help="Meta-learner trained on the base models' probabilities.")
+    p.add_argument("--features", default="probs", choices=FEATURES,
+                   help="Meta-features: the probabilities or their logarithms (suits logreg; "
+                        "the trees are invariant to it).")
     # Hyper-parameters shared by all meta-learners
     p.add_argument("--class_weight", default="balanced", choices=CLASS_WEIGHTS,
                    help="'balanced_subsample' is available only for rf.")
@@ -214,6 +259,7 @@ def get_args():
     # XGBoost only
     p.add_argument("--subsample", default=1.0, type=float)
     p.add_argument("--colsample_bytree", default=1.0, type=float)
+    p.add_argument("--min_child_weight", default=1.0, type=float)
     # CatBoost only
     p.add_argument("--l2_leaf_reg", default=3.0, type=float)
     # Logistic regression only
@@ -248,6 +294,7 @@ def main():
         min_samples_leaf=args.min_samples_leaf,
         subsample=args.subsample,
         colsample_bytree=args.colsample_bytree,
+        min_child_weight=args.min_child_weight,
         l2_leaf_reg=args.l2_leaf_reg,
         C=args.C,
         max_iter=args.max_iter,
@@ -255,22 +302,32 @@ def main():
         random_state=args.random_state,
         n_jobs=args.n_jobs,
     )
-    print(f"[stacking] training {meta_name} on val: {X_val.shape} ...")
-    fit_meta_learner(meta, X_val, y_val, class_weight=args.class_weight)
+    print(f"[stacking] training {meta_name} on val ({args.features}): {X_val.shape} ...")
+    fit_meta_learner(meta, meta_features(X_val, args.features), y_val,
+                     class_weight=args.class_weight)
 
     # --- Predict on test, columns in the canonical 0..C-1 class order ---
-    proba = predict_proba_canonical(meta, X_test, n_classes)
+    proba = predict_proba_canonical(meta, meta_features(X_test, args.features), n_classes)
 
     # --- Reporting: base models alone vs. the stacked meta-learner ---
-    jit_test_metrics = metrics_from_probs(base_model_probs_from_X(X_test, n_classes, "jit"),
-                                          y_test, classes, detailed=True)
-    mamba_test_metrics = metrics_from_probs(base_model_probs_from_X(X_test, n_classes, "mamba"),
-                                            y_test, classes, detailed=True)
+    jit_proba = base_model_probs_from_X(X_test, n_classes, "jit")
+    mamba_proba = base_model_probs_from_X(X_test, n_classes, "mamba")
+    # Untrained baseline: plain average of the two models' probabilities
+    avg_proba = (jit_proba + mamba_proba) / 2
+    jit_test_metrics = metrics_from_probs(jit_proba, y_test, classes, detailed=True)
+    mamba_test_metrics = metrics_from_probs(mamba_proba, y_test, classes, detailed=True)
+    avg_test_metrics = metrics_from_probs(avg_proba, y_test, classes, detailed=True)
     meta_test_metrics = metrics_from_probs(proba, y_test, classes, detailed=True)
 
     print_report("BASE — JITrans (test)", jit_test_metrics, classes)
     print_report("BASE — Mamba (test)", mamba_test_metrics, classes)
+    print_report("BASELINE — average of the probabilities (test)", avg_test_metrics, classes)
     print_report(f"STACKING — {meta_name} (test)", meta_test_metrics, classes)
+
+    comparisons = {other: paired_comparison(proba, other_proba, y_test, seed=args.random_state)
+                   for other, other_proba in (("mamba", mamba_proba), ("jit", jit_proba),
+                                              ("average", avg_proba))}
+    print_comparisons(meta_name, comparisons)
 
     best_base = max(jit_test_metrics["accuracy"], mamba_test_metrics["accuracy"])
     print(f"\n[stacking] test accuracy — JITrans: {jit_test_metrics['accuracy']:.4f} | "
@@ -283,17 +340,20 @@ def main():
     os.makedirs(args.out_dir, exist_ok=True)
     model_path = os.path.join(args.out_dir, f"{args.meta_learner}_meta.joblib")
     joblib.dump({"meta_learner": args.meta_learner, "model": meta, "classes": classes,
-                 "feature_order": ["jit", "mamba"]}, model_path)
+                 "feature_order": ["jit", "mamba"], "features": args.features}, model_path)
 
     metrics_path = os.path.join(args.out_dir,
                                 f"stacking_test_metrics_{args.meta_learner}.json")
     payload = {
         "classes": classes,
         "meta_learner": args.meta_learner,
+        "features": args.features,
         "meta_params": meta.get_params(),
         "base_jit_test": to_serializable(jit_test_metrics),
         "base_mamba_test": to_serializable(mamba_test_metrics),
+        "baseline_average_test": to_serializable(avg_test_metrics),
         f"stacking_{args.meta_learner}_test": to_serializable(meta_test_metrics),
+        f"stacking_{args.meta_learner}_vs": comparisons,
     }
     with open(metrics_path, "w") as f:
         # default=str: some library parameters (e.g. callables) are not JSON types

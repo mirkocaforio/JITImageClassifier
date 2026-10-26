@@ -28,6 +28,10 @@ DISPLAY_NAMES = {"rf": "RandomForest", "xgboost": "XGBoost", "catboost": "CatBoo
                  "logreg": "Multinomial LogReg"}
 TREE_ENSEMBLES = ("rf", "xgboost", "catboost")
 CLASS_WEIGHTS = ("balanced", "balanced_subsample", "none")
+# Meta-features fed to the meta-learner: the base models' probabilities as they are, or their
+# logarithms (the softmax logits up to a per-model constant), which suit the linear model
+FEATURES = ("probs", "logprobs")
+LOG_EPS = 1e-7
 
 # Tree depth used by the boosting models when --max_depth is not given
 # (an unlimited depth is only meaningful for the RandomForest)
@@ -56,6 +60,22 @@ def is_tree_ensemble(model):
     return meta_learner_name(model) in TREE_ENSEMBLES
 
 
+def meta_features(X, features="probs"):
+    """
+    Turn the stacked probabilities X = [probs_jit | probs_mamba] into the meta-learner input.
+
+    'logprobs' takes log(max(p, LOG_EPS)): for the logistic regression this makes the model a
+    weighted product of the two softmaxes (a learned geometric mean / temperature scaling)
+    instead of a linear function of bounded probabilities. The trees are invariant to it, as
+    the log is monotonic in every feature.
+    """
+    if features not in FEATURES:
+        raise ValueError(f"features must be one of {FEATURES}, got '{features}'")
+    if features == "logprobs":
+        return np.log(np.clip(X, LOG_EPS, 1.0))
+    return X
+
+
 # ---------------------------------------------------------------------------
 # Construction / training
 # ---------------------------------------------------------------------------
@@ -69,12 +89,14 @@ def build_meta_learner(
     min_samples_leaf=1,
     subsample=1.0,
     colsample_bytree=1.0,
+    min_child_weight=1.0,
     l2_leaf_reg=3.0,
     C=1.0,
     max_iter=1000,
     class_weight="balanced",
     random_state=42,
     n_jobs=-1,
+    early_stopping_rounds=None,
 ):
     """
     Instantiate an (unfitted) meta-learner.
@@ -86,6 +108,7 @@ def build_meta_learner(
         learning_rate (float): Shrinkage of the boosting models (ignored by rf).
         min_samples_leaf (int): rf only.
         subsample, colsample_bytree (float): xgboost only (row / column sampling per tree).
+        min_child_weight (float): xgboost only (minimum hessian sum in a leaf).
         l2_leaf_reg (float): catboost only (L2 regularisation of the leaf values).
         C (float): logreg only (inverse of the L2 regularisation strength).
         max_iter (int): logreg only (lbfgs iterations).
@@ -93,6 +116,8 @@ def build_meta_learner(
         random_state (int): Seed.
         n_jobs (int): Threads (-1 = all cores). Ignored by logreg, whose n_jobs is
             deprecated in scikit-learn >= 1.8 (lbfgs threads through BLAS).
+        early_stopping_rounds (int | None): boosting only. Needs an eval_set in
+            fit_meta_learner, so it is used by tune_meta.py on the CV folds, never on test.
     Returns:
         The estimator. Train it with `fit_meta_learner`, which applies the class weighting
         of the libraries that take it at fit time (xgboost).
@@ -143,8 +168,10 @@ def build_meta_learner(
             learning_rate=learning_rate,
             subsample=subsample,
             colsample_bytree=colsample_bytree,
+            min_child_weight=min_child_weight,
             tree_method="hist",
             eval_metric="logloss" if n_classes == 2 else "mlogloss",
+            early_stopping_rounds=early_stopping_rounds,
             random_state=random_state,
             n_jobs=n_jobs,
         )
@@ -158,6 +185,7 @@ def build_meta_learner(
         l2_leaf_reg=l2_leaf_reg,
         loss_function="Logloss" if n_classes == 2 else "MultiClass",
         auto_class_weights=None if class_weight == "none" else "Balanced",
+        early_stopping_rounds=early_stopping_rounds,
         random_seed=random_state,
         thread_count=n_jobs,
         verbose=False,
@@ -175,13 +203,23 @@ def check_labels(y, n_classes, split_name="val"):
         )
 
 
-def fit_meta_learner(model, X, y, class_weight="balanced"):
-    """Fit the meta-learner; xgboost has no class_weight, so balancing goes through sample_weight."""
+def fit_meta_learner(model, X, y, class_weight="balanced", eval_set=None):
+    """
+    Fit the meta-learner; xgboost has no class_weight, so balancing goes through sample_weight.
+    eval_set=(X_eval, y_eval) drives the early stopping of the boosting models (tune_meta.py).
+    """
     name = meta_learner_name(model)
-    if name == "xgboost" and class_weight.lower() == "balanced":
-        from sklearn.utils.class_weight import compute_sample_weight
+    if name == "xgboost":
+        kwargs = {}
+        if class_weight.lower() == "balanced":
+            from sklearn.utils.class_weight import compute_sample_weight
 
-        return model.fit(X, y, sample_weight=compute_sample_weight("balanced", y))
+            kwargs["sample_weight"] = compute_sample_weight("balanced", y)
+        if eval_set is not None:
+            kwargs.update(eval_set=[eval_set], verbose=False)
+        return model.fit(X, y, **kwargs)
+    if name == "catboost" and eval_set is not None:
+        return model.fit(X, y, eval_set=eval_set)
     if name == "logreg":
         from sklearn.exceptions import ConvergenceWarning
 
@@ -195,6 +233,16 @@ def fit_meta_learner(model, X, y, class_weight="balanced"):
                   f"lbfgs iterations: raise --max_iter")
         return model
     return model.fit(X, y)
+
+
+def best_iteration(model):
+    """Boosting rounds kept by early stopping (1-based), None for the other meta-learners."""
+    name = meta_learner_name(model)
+    if name == "xgboost" and getattr(model, "best_iteration", None) is not None:
+        return int(model.best_iteration) + 1
+    if name == "catboost" and model.get_best_iteration() is not None:
+        return int(model.get_best_iteration()) + 1
+    return None
 
 
 # ---------------------------------------------------------------------------

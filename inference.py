@@ -3717,9 +3717,13 @@ class StackingInference(BaseEvaluator):
         self.MODEL_NAME = f"stacking_{self.meta_learner}"
         meta_classes = [str(c) for c in bundle['classes']]
         self.feature_order = bundle.get('feature_order', ['jit', 'mamba'])
+        # Bundles written before --features was added were trained on the probabilities.
+        # The blocks below keep the probabilities (the base-model metrics slice them);
+        # the transform is applied only on the way into the meta-learner.
+        self.features = bundle.get('features', 'probs')
         print(f"{OK} Stacking meta-model loaded: {meta_path}")
         print(f"  meta-learner:  {self.meta_display} ({type(self.meta).__name__})")
-        print(f"  feature order: {self.feature_order}")
+        print(f"  feature order: {self.feature_order} ({self.features})")
 
         # Load and align the exported probabilities for the needed splits.
         needed = ['val', 'test'] if split in ('both', 'separate') else [split]
@@ -3942,11 +3946,19 @@ class StackingInference(BaseEvaluator):
                 self._predict_single_thread = False
 
     def _raw_predict_proba(self, X: np.ndarray) -> np.ndarray:
-        """`predict_proba` with the columns in `classes_` order."""
-        from meta_learners import raw_predict_proba
+        """`predict_proba` with the columns in `classes_` order.
 
-        return raw_predict_proba(self.meta, X,
+        X holds the stacked probabilities; the --features transform of stacking.py is
+        applied here, so it is part of the timed meta-learner call.
+        """
+        from meta_learners import meta_features, raw_predict_proba
+
+        return raw_predict_proba(self.meta, meta_features(X, self.features),
                                  getattr(self, '_predict_single_thread', False))
+
+    def _features_label(self) -> str:
+        kind = 'log-probabilities' if self.features == 'logprobs' else 'probabilities'
+        return f"{' + '.join(self.feature_order)} {kind}"
 
     def _default_block(self, split_name: Optional[str] = None) -> Tuple[str, Dict]:
         """The split used for the analyses: test when available (val is in-sample)."""
@@ -4007,7 +4019,7 @@ class StackingInference(BaseEvaluator):
         Logistic regression: see `_linear_model_complexity`.
         """
         import pickle
-        from meta_learners import is_tree_ensemble, n_threads, tree_ensemble_stats
+        from meta_learners import is_tree_ensemble, meta_features, n_threads, tree_ensemble_stats
 
         meta = self.meta
         if not is_tree_ensemble(meta):
@@ -4018,7 +4030,7 @@ class StackingInference(BaseEvaluator):
         X = block['X']
         if len(X) > max_path_samples:
             X = X[np.sort(self._sample_indices(len(X), max_path_samples, 0))]
-        stats = tree_ensemble_stats(meta, X)
+        stats = tree_ensemble_stats(meta, meta_features(X, self.features))
         comparisons = stats['comparisons_per_sample']
         accumulation = stats['additions_per_sample']
         stored_values = stats['stored_values']
@@ -4034,6 +4046,7 @@ class StackingInference(BaseEvaluator):
             'n_estimators': int(n_estimators) if n_estimators is not None else None,
             'n_trees': stats['n_trees'],
             'n_features_in': int(getattr(meta, 'n_features_in_', X.shape[1])),
+            'features': self.features,
             'n_classes': n_classes,
             'max_depth_param': stats['max_depth_param'],
             'total_nodes': stats['total_nodes'],
@@ -4066,7 +4079,7 @@ class StackingInference(BaseEvaluator):
             "=" * 60,
             f"Estimator:             {results['estimator']}  ({stats['n_trees']} trees)",
             f"Meta-features:         {results['n_features_in']}  "
-            f"({' + '.join(self.feature_order)} probabilities)",
+            f"({self._features_label()})",
             f"Nodes / leaves:        {results['total_nodes']:,} / {results['total_leaves']:,}",
             f"Depth (max / mean):    {results['max_depth']} / {results['mean_depth']:.1f}",
             f"Stored values:         {results['stored_values_formatted']} ({stored_values:,})"
@@ -4113,6 +4126,7 @@ class StackingInference(BaseEvaluator):
             'n_estimators': None,
             'n_trees': None,
             'n_features_in': stats['n_features'],
+            'features': self.features,
             'n_classes': stats['n_classes_fitted'],
             'max_depth_param': None,
             'total_nodes': None,
@@ -4153,7 +4167,7 @@ class StackingInference(BaseEvaluator):
             f"Estimator:             {results['estimator']}  (C={meta.C:g}, "
             f"{results['n_iter']}/{meta.max_iter} lbfgs iterations)",
             f"Meta-features:         {results['n_features_in']}  "
-            f"({' + '.join(self.feature_order)} probabilities)",
+            f"({self._features_label()})",
             f"Parameters:            {fmt(total_params)} ({total_params:,})  "
             f"[{stats['n_weights']:,} weights + {stats['n_biases']:,} biases, NumPy]",
             f"Size (serialized):     {serialized_mb:.4f} MB",
