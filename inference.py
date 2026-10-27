@@ -4635,7 +4635,7 @@ class StackingInference(BaseEvaluator):
         micro score is still reported in the legend.
         """
         fig, ax = plt.subplots(figsize=(8, 7))
-        colors = {'jit': '#1f77b4', 'mamba': '#ff7f0e', 'stacking': '#2ca02c'}
+        colors = {'JITClassifier': '#1f77b4', 'RoadRunnerMamba': '#ff7f0e', 'Stacking': '#2ca02c'}
         metric = 'AUC' if kind == 'roc' else 'AP'
         lines = []
 
