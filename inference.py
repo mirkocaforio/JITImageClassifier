@@ -1664,20 +1664,22 @@ class BaseEvaluator:
         if not rows:
             return None
 
+        # --compare results carry a readable name; split results fall back to the key
+        headers = [results_by_key[k].get('display_name') or k.upper() for k in keys]
         label_width = max(len(label) for label, _ in rows) + 2
-        col_width = 14
+        col_width = max(14, max(len(h) for h in headers) + 2)
 
         print(f"\n{'='*66}")
         print(title)
         print(f"{'='*66}")
-        print(f"{'Metric':<{label_width}}" + ''.join(f"{k.upper():>{col_width}}" for k in keys))
+        print(f"{'Metric':<{label_width}}" + ''.join(f"{h:>{col_width}}" for h in headers))
         print('-' * (label_width + col_width * len(keys)))
         for label, values in rows:
             print(f"{label:<{label_width}}" + ''.join(f"{v:>{col_width}}" for v in values))
         for column in keys:
             note = results_by_key[column].get('note')
             if note:
-                print(f"{WARN} {column}: {note}")
+                print(f"{WARN} {results_by_key[column].get('display_name') or column}: {note}")
         print(f"{'='*66}")
 
         if not out_dir:
@@ -1688,7 +1690,8 @@ class BaseEvaluator:
         path = os.path.join(out_dir, name)
         with open(path, 'w', newline='', encoding='utf-8') as fh:
             writer = csv.writer(fh)
-            writer.writerow(['metric'] + keys)
+            writer.writerow(['metric'] + [results_by_key[k].get('display_name') or k
+                                          for k in keys])
             for label, values in rows:
                 writer.writerow([label] + values)
         print(f"  {OK} saved {ARROW} {path}")
@@ -3677,6 +3680,8 @@ class StackingInference(BaseEvaluator):
 
     # Completed with the meta-learner in __init__ (e.g. 'stacking_xgboost')
     MODEL_NAME = 'stacking'
+    # Names shown in the --compare plots and table; the keys stay the internal ones
+    BASE_DISPLAY_NAMES = {'jit': 'JITClassifier', 'mamba': 'RoadRunnerMamba'}
 
     def __init__(
         self,
@@ -4619,11 +4624,18 @@ class StackingInference(BaseEvaluator):
             '_confidences': confidences,
             '_indices': np.arange(len(targets)),
         }
+        results['display_name'] = self._display_name(model_name)
         results.update(self._extended_metrics(
             np.asarray(targets), predictions, probs, confidences, class_names))
         if note:
             results['note'] = note
         return results
+
+    def _display_name(self, model_name: str) -> str:
+        """Readable name of a --compare model: e.g. 'stacking_rf' -> 'Stacking (RandomForest)'."""
+        if model_name == self.MODEL_NAME:
+            return f"Stacking ({self.meta_display})"
+        return self.BASE_DISPLAY_NAMES.get(model_name, model_name)
 
     def _plot_curve_overlay(
         self, results_by_model, split_name, kind, save_dir, show, dpi, plot_format
@@ -4635,7 +4647,7 @@ class StackingInference(BaseEvaluator):
         micro score is still reported in the legend.
         """
         fig, ax = plt.subplots(figsize=(8, 7))
-        colors = {'JITClassifier': '#1f77b4', 'RoadRunnerMamba': '#ff7f0e', 'Stacking': '#2ca02c'}
+        colors = {'jit': '#1f77b4', 'mamba': '#ff7f0e', 'stacking': '#2ca02c'}
         metric = 'AUC' if kind == 'roc' else 'AP'
         lines = []
 
@@ -4654,7 +4666,8 @@ class StackingInference(BaseEvaluator):
             else:
                 x, y, _ = curves['macro'][kind]
             style = dict(color=colors.get(model_name.split('_')[0]), lw=2)
-            ax.plot(x, y, label=(f"{model_name}  (macro {metric} = {scores[f'{kind}_auc_macro']:.4f}, "
+            label = results.get('display_name', model_name)
+            ax.plot(x, y, label=(f"{label}  (macro {metric} = {scores[f'{kind}_auc_macro']:.4f}, "
                                  f"micro = {scores[f'{kind}_auc_micro']:.4f})"), **style)
             lines.append((x, y, style))
 
